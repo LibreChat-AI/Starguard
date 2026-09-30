@@ -14,3 +14,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # A new Python minor is not a base image refresh. The lock files are
+      # compiled for 3.11 and CI tests 3.11 and 3.12, so moving the image to
+      # 3.14 installed a dependency set nothing had resolved or tested, and
+      # pip refused it (audioop-lts is only required from 3.13). Digest
+      # updates within 3.12 still arrive; a minor bump is a deliberate change.
+      - dependency-name: "python"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
