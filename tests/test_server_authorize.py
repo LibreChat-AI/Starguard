@@ -27,7 +27,7 @@ from requests.exceptions import ConnectTimeout, ReadTimeout
 from common.storage import STAR_SOURCE_WEBHOOK, link_account, record_star_event
 from common.storage_errors import StorageError
 from server import messages
-from server.server import ServerContext, connect_users, create_app, main
+from server.server import ServerContext, connect_users, create_app, main, waitress_options
 from server.webhooks import MAX_REQUEST_BODY_BYTES
 from tests.test_server_routes import ENVIRONMENT, make_config
 from tests.test_storage import FakeCollection
@@ -564,3 +564,49 @@ def test_main_serves_the_application_with_waitress(monkeypatch):
     # default. The webhook route is public and deliberately not rate
     # limited, and a body this bounds is the stated reason that is safe.
     assert served["max_request_body_size"] == MAX_REQUEST_BODY_BYTES
+    # One hop is trusted by default, so ProxyFix decides and waitress must
+    # hand it the forwarded headers.
+    assert served["clear_untrusted_proxy_headers"] is False
+
+
+def _scheme_seen_behind(options, hops):
+    """Start a real waitress with ``options`` and report the scheme Flask
+    would build URLs with for a request a proxy forwarded over https."""
+    # pylint: disable=import-outside-toplevel
+    import threading
+    import urllib.request
+
+    from waitress.server import create_server
+    from werkzeug.middleware.proxy_fix import ProxyFix
+
+    def scheme_app(environ, start_response):
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [environ["wsgi.url_scheme"].encode()]
+
+    app = ProxyFix(scheme_app, x_for=hops, x_proto=hops, x_host=hops) if hops else scheme_app
+    options = {**options, "host": "127.0.0.1", "port": 0}
+    server = create_server(app, **options)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        port = server.effective_port
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/", headers={"X-Forwarded-Proto": "https"}
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:  # nosec B310
+            return response.read().decode()
+    finally:
+        server.close()
+
+
+def test_a_trusted_proxy_s_https_reaches_the_application():
+    # The production failure: waitress deleted X-Forwarded-Proto before
+    # ProxyFix could read it, the redirect_uri went out as http:// and
+    # GitHub refused it. This runs the real waitress, not a stub of it.
+    options = waitress_options(make_config(trusted_proxy_count=1))
+    assert _scheme_seen_behind(options, hops=1) == "https"
+
+
+def test_with_no_proxy_trusted_a_forwarded_scheme_is_not_believed():
+    options = waitress_options(make_config(trusted_proxy_count=0))
+    assert _scheme_seen_behind(options, hops=0) == "http"

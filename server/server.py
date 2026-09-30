@@ -64,6 +64,9 @@ NOT_STARRED_STATUS: Final = 404
 
 RATE_LIMITED_ENDPOINTS: Final[tuple[str, ...]] = ("login", "authorize")
 
+# Every interface, on purpose; see the B104 note in main().
+BIND_ALL_INTERFACES: Final = "0.0.0.0"  # nosec B104
+
 
 # Distinguishes "no collection was passed" from "the database is down", which
 # are different states that both look like None. A one-member enum rather
@@ -455,11 +458,10 @@ def main() -> None:
     # B104: binding to every interface is the point. This process runs
     # in a container and is reached from another one, so loopback would make
     # it unreachable; what is and is not published is the compose file's job.
-    # Bandit prints "nosec encountered (B104), but no failed test" here.
-    # That warning is wrong: delete the suppression and B104 fires on the
-    # host line below. An unscoped suppression, one with no test id after
-    # it, silences that warning but would also hide any future finding on
-    # that line, so the scoped form stays. Spelling the unscoped form out
+    # The suppression is scoped and sits on BIND_ALL_INTERFACES, the one
+    # line B104 fires on; delete it and bandit fails there. An unscoped
+    # suppression, one with no test id after it, would also hide any future
+    # finding on that line, so the scoped form stays. Spelling the unscoped form out
     # here is not an option either: bandit reads the token wherever it
     # appears in a comment, prose included, and parses the rest of the
     # line as test ids, so quoting it printed six warnings of its own.
@@ -472,13 +474,43 @@ def main() -> None:
     # public webhook endpoint buffer a thousand times what that route is
     # documented to bound. The bounded body is the stated reason that route
     # is safe to leave unlimited, so it has to hold at the front door.
-    serve(
-        app,
-        host="0.0.0.0",  # nosec B104
-        port=config.port,
-        ident="Starguard",
-        max_request_body_size=MAX_REQUEST_BODY_BYTES,
-    )
+    serve(app, **waitress_options(config))
+
+
+class WaitressOptions(TypedDict):
+    """The keyword arguments main() hands to waitress."""
+
+    host: str
+    port: int
+    ident: str
+    max_request_body_size: int
+    clear_untrusted_proxy_headers: bool
+
+
+def waitress_options(config: ServerConfig) -> WaitressOptions:
+    """Return the keyword arguments main() hands to waitress.
+
+    Split out so a test can start a real waitress with exactly these, which
+    is the only way to see what waitress does to a request before Flask.
+
+    clear_untrusted_proxy_headers is the reason that matters. waitress
+    defaults it to True and, with no trusted_proxy of its own, deletes every
+    X-Forwarded-* header before the application is called. ProxyFix then had
+    nothing to read, every request looked like plain http, and the OAuth
+    redirect_uri went out as http://, which GitHub refuses as not associated
+    with the application: nobody behind Railway could link an account. When
+    a proxy is trusted, deciding what to believe is ProxyFix's job, with the
+    hop count it is configured for, so waitress passes the headers through.
+    With no proxy trusted there is nothing to believe, and waitress keeps
+    stripping them, which is the same rule create_app follows.
+    """
+    return {
+        "host": BIND_ALL_INTERFACES,
+        "port": config.port,
+        "ident": "Starguard",
+        "max_request_body_size": MAX_REQUEST_BODY_BYTES,
+        "clear_untrusted_proxy_headers": not config.trusted_proxy_count,
+    }
 
 
 if __name__ == "__main__":
